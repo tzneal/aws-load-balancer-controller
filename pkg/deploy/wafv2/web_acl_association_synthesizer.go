@@ -2,10 +2,10 @@ package wafv2
 
 import (
 	"context"
+	"fmt"
 	"github.com/go-logr/logr"
 	"github.com/pkg/errors"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/model/core"
-	elbv2model "sigs.k8s.io/aws-load-balancer-controller/pkg/model/elbv2"
 	wafv2model "sigs.k8s.io/aws-load-balancer-controller/pkg/model/wafv2"
 )
 
@@ -26,25 +26,18 @@ type webACLAssociationSynthesizer struct {
 
 func (s *webACLAssociationSynthesizer) Synthesize(ctx context.Context) error {
 	var resAssociations []*wafv2model.WebACLAssociation
-	s.stack.ListResources(&resAssociations)
+	if err := s.stack.ListResources(&resAssociations); err != nil {
+		return fmt.Errorf("[should never happen] failed to list resources: %w", err)
+	}
+	if len(resAssociations) == 0 {
+		return nil
+	}
 	resAssociationsByResARN, err := mapResWebACLAssociationByResourceARN(resAssociations)
 	if err != nil {
 		return err
 	}
-
-	var resLBs []*elbv2model.LoadBalancer
-	s.stack.ListResources(&resLBs)
-	for _, resLB := range resLBs {
-		// wafv2 WebACL can only be associated with ALB for now.
-		if resLB.Spec.Type != elbv2model.LoadBalancerTypeApplication {
-			continue
-		}
-		lbARN, err := resLB.LoadBalancerARN().Resolve(ctx)
-		if err != nil {
-			return err
-		}
-		resAssociations := resAssociationsByResARN[lbARN]
-		if err := s.synthesizeWebACLAssociationsOnLB(ctx, lbARN, resAssociations); err != nil {
+	for resARN, webACLAssociations := range resAssociationsByResARN {
+		if err := s.synthesizeWebACLAssociationsOnLB(ctx, resARN, webACLAssociations); err != nil {
 			return err
 		}
 	}
@@ -57,14 +50,10 @@ func (s *webACLAssociationSynthesizer) PostSynthesize(ctx context.Context) error
 }
 
 func (s *webACLAssociationSynthesizer) synthesizeWebACLAssociationsOnLB(ctx context.Context, lbARN string, resAssociations []*wafv2model.WebACLAssociation) error {
-	if len(resAssociations) > 1 {
-		return errors.Errorf("[should never happen] multiple WAFv2 webACL desired on LoadBalancer: %v", lbARN)
+	if len(resAssociations) != 1 {
+		return errors.Errorf("[should never happen] should be exactly one WAFv2 webACL association on LoadBalancer: %v", lbARN)
 	}
-
-	var desiredWebACLARN string
-	if len(resAssociations) == 1 {
-		desiredWebACLARN = resAssociations[0].Spec.WebACLARN
-	}
+	desiredWebACLARN := resAssociations[0].Spec.WebACLARN
 	currentWebACLARN, err := s.associationManager.GetAssociatedWebACL(ctx, lbARN)
 	if err != nil {
 		return err
